@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"slices"
 	"strconv"
+	"unsafe"
 )
 
 type stats [4]int
@@ -86,7 +87,6 @@ func Average(fname string, out io.Writer) {
 				b := make([]byte, 10<<20)
 				var offset int64
 				pending := make([]byte, 0, 256)
-				var station string
 				var valRaw float64
 				var val10 int
 
@@ -124,13 +124,15 @@ func Average(fname string, out io.Writer) {
 
 						val10 = int(valRaw * 10)
 
-						station = string(line[:delimIdx])
-						sts := stations[station]
+						// Avoid string allocation
+						key := unsafe.String(unsafe.SliceData(line[:delimIdx]), delimIdx)
+						sts := stations[key]
 						if sts == nil {
+							station := string(line[:delimIdx])
 							stations[station] = &stats{val10, val10, val10, 1}
 						} else {
-							sts[0] = min(stations[station][0], val10)
-							sts[1] = max(stations[station][1], val10)
+							sts[0] = min(sts[0], val10)
+							sts[1] = max(sts[1], val10)
 							sts[2] += val10
 							sts[3]++
 						}
@@ -158,8 +160,8 @@ func Average(fname string, out io.Writer) {
 			if sts == nil {
 				totalStations[station] = &stats{s[0], s[1], s[2], s[3]}
 			} else {
-				sts[0] = min(totalStations[station][0], s[0])
-				sts[1] = max(totalStations[station][1], s[1])
+				sts[0] = min(sts[0], s[0])
+				sts[1] = max(sts[1], s[1])
 				sts[2] += s[2]
 				sts[3] += s[3]
 			}
