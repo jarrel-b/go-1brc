@@ -2,18 +2,35 @@ package batchopt
 
 import (
 	"bytes"
+	"container/heap"
 	"fmt"
 	"io"
-	"maps"
 	"math"
 	"os"
 	"runtime"
-	"slices"
 	"strconv"
 	"unsafe"
 )
 
 type stats [4]int
+
+type stationHeap []string
+
+func (h stationHeap) Len() int           { return len(h) }
+func (h stationHeap) Less(i, j int) bool { return h[i] < h[j] }
+func (h stationHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+
+func (h *stationHeap) Push(x any) {
+	*h = append(*h, x.(string))
+}
+
+func (h *stationHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	*h = old[:n-1]
+	return item
+}
 
 func Average(fname string, out io.Writer) {
 	fi, err := os.Stat(fname)
@@ -82,76 +99,90 @@ func Average(fname string, out io.Writer) {
 	for range numWorkers {
 		go func(f *os.File) {
 			stations := make(map[string]*stats)
+			work := processing
+			var done chan map[string]*stats
 
-			for chunk := range processing {
-				b := make([]byte, 10<<20)
-				var offset int64
-				pending := make([]byte, 0, 256)
-				var valRaw float64
-				var val10 int
+			for {
+				select {
+				case chunk, ok := <-work:
+					if !ok {
+						work = nil
+						done = merging
+						continue
+					}
 
-				for offset < chunk[1]-chunk[0] {
-					remaining := chunk[1] - chunk[0] - offset
-					readSize := min(remaining, int64(len(b)))
+					b := make([]byte, 10<<20)
+					var offset int64
+					pending := make([]byte, 0, 256)
+					var valRaw float64
+					var val10 int
 
-					n, err := f.ReadAt(b[:readSize], chunk[0]+offset)
-					if err != nil {
-						if err != io.EOF {
-							panic(err)
+					for offset < chunk[1]-chunk[0] {
+						remaining := chunk[1] - chunk[0] - offset
+						readSize := min(remaining, int64(len(b)))
+
+						n, err := f.ReadAt(b[:readSize], chunk[0]+offset)
+						if err != nil {
+							if err != io.EOF {
+								panic(err)
+							}
 						}
-					}
 
-					if n > 0 {
-						pending = append(pending, b[:n]...)
-					}
+						if n > 0 {
+							pending = append(pending, b[:n]...)
+						}
 
-					for {
-						newLineIdx := bytes.IndexByte(pending, '\n')
-						if newLineIdx == -1 {
+						for {
+							newLineIdx := bytes.IndexByte(pending, '\n')
+							if newLineIdx == -1 {
+								break
+							}
+
+							line := pending[:newLineIdx]
+							delimIdx := bytes.IndexByte(line, ';')
+							if delimIdx == -1 {
+								panic("malformed record: missing semicolon")
+							}
+
+							valRaw, err = strconv.ParseFloat(string(line[delimIdx+1:]), 64)
+							if err != nil {
+								panic(err)
+							}
+
+							val10 = int(valRaw * 10)
+
+							// Avoid string allocation
+							key := unsafe.String(unsafe.SliceData(line[:delimIdx]), delimIdx)
+							sts := stations[key]
+							if sts == nil {
+								station := string(line[:delimIdx])
+								stations[station] = &stats{val10, val10, val10, 1}
+							} else {
+								sts[0] = min(sts[0], val10)
+								sts[1] = max(sts[1], val10)
+								sts[2] += val10
+								sts[3]++
+							}
+
+							pending = pending[newLineIdx+1:]
+						}
+
+						offset += int64(n)
+
+						if err == io.EOF {
 							break
 						}
-
-						line := pending[:newLineIdx]
-						delimIdx := bytes.IndexByte(line, ';')
-						if delimIdx == -1 {
-							panic("malformed record: missing semicolon")
-						}
-
-						valRaw, err = strconv.ParseFloat(string(line[delimIdx+1:]), 64)
-						if err != nil {
-							panic(err)
-						}
-
-						val10 = int(valRaw * 10)
-
-						// Avoid string allocation
-						key := unsafe.String(unsafe.SliceData(line[:delimIdx]), delimIdx)
-						sts := stations[key]
-						if sts == nil {
-							station := string(line[:delimIdx])
-							stations[station] = &stats{val10, val10, val10, 1}
-						} else {
-							sts[0] = min(sts[0], val10)
-							sts[1] = max(sts[1], val10)
-							sts[2] += val10
-							sts[3]++
-						}
-
-						pending = pending[newLineIdx+1:]
 					}
 
-					offset += int64(n)
-
-					if err == io.EOF {
-						break
-					}
+				case done <- stations:
+					return
 				}
 			}
-			merging <- stations
 		}(f)
 	}
 
 	totalStations := make(map[string]*stats)
+	stationNames := make(stationHeap, 0)
 
 	for range numWorkers {
 		stations := <-merging
@@ -159,6 +190,7 @@ func Average(fname string, out io.Writer) {
 			sts := totalStations[station]
 			if sts == nil {
 				totalStations[station] = &stats{s[0], s[1], s[2], s[3]}
+				heap.Push(&stationNames, station)
 			} else {
 				sts[0] = min(sts[0], s[0])
 				sts[1] = max(sts[1], s[1])
@@ -168,10 +200,8 @@ func Average(fname string, out io.Writer) {
 		}
 	}
 
-	stationNames := slices.Collect(maps.Keys(totalStations))
-	slices.Sort(stationNames)
-
-	for _, name := range stationNames {
+	for stationNames.Len() > 0 {
+		name := heap.Pop(&stationNames).(string)
 		stats := totalStations[name]
 		fmt.Fprintf(out, "%s;%.1f;%.1f;%.1f\n", name, float64(stats[0])*0.1, mean1BRC(stats[2], stats[3]), float64(stats[1])*0.1)
 	}
